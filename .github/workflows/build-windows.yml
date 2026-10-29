@@ -1,0 +1,129 @@
+name: Build LA-2A VST3 (Windows)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: la2a-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          cmake --version
+          git --version
+          cl 2>&1 | Select-Object -First 3
+
+      - name: Configure project
+        shell: pwsh
+        run: |
+          if (Test-Path build) {
+            Remove-Item build -Recurse -Force
+          }
+          cmake -S . -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DFETCHCONTENT_QUIET=OFF
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "CMake configure failed."
+            exit $LASTEXITCODE
+          }
+
+      - name: Build VST3 and Standalone
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2 2>&1 |
+            Tee-Object -FilePath build-output.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "---- Compiler errors and nearby context ----"
+            Select-String -Path build-output.log `
+              -Pattern "error C[0-9]+|fatal error|CMake Error|FAILED:" `
+              -Context 3,3
+            exit 1
+          }
+
+      - name: Run available tests
+        shell: pwsh
+        run: |
+          $tests = Get-ChildItem build -Recurse -File `
+            -Filter "*test*.exe" -ErrorAction SilentlyContinue
+          if (-not $tests) {
+            Write-Host "No standalone test executables found."
+          }
+          foreach ($test in $tests) {
+            Write-Host "Running $($test.FullName)"
+            & $test.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Collect artifacts
+        if: success()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $plugins = Get-ChildItem build -Recurse -Directory `
+            -Filter "*.vst3" -ErrorAction SilentlyContinue
+          foreach ($plugin in $plugins) {
+            Copy-Item $plugin.FullName `
+              (Join-Path "artifacts" $plugin.Name) -Recurse -Force
+          }
+          $standalone = Get-ChildItem build -Recurse -File `
+            -Filter "*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "Standalone" }
+          foreach ($exe in $standalone) {
+            Copy-Item $exe.FullName "artifacts" -Force
+          }
+          if (-not (Get-ChildItem artifacts -Force | Select-Object -First 1)) {
+            Write-Error "No VST3 or Standalone artifact found."
+            exit 1
+          }
+
+      - name: Upload Windows plugin
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LA2A-Windows-VST3
+          path: artifacts/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Print build diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path build) {
+            Get-ChildItem build -Recurse -File `
+              -Include CMakeError.log,CMakeOutput.log,*.log |
+              Select-Object -First 100 -ExpandProperty FullName
+          }
+          if (Test-Path build-output.log) {
+            Write-Host "---- First compiler/configuration errors ----"
+            Select-String -Path build-output.log `
+              -Pattern "error C[0-9]+|fatal error|CMake Error|FAILED:" `
+              -Context 3,3
+          }
